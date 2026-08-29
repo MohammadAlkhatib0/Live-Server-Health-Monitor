@@ -30,6 +30,12 @@ function App() {
     disk: 0,
     disk_used_gb: 0,
     disk_total_gb: 0,
+    temperature: 45.0,
+    load_1m: 0.0,
+    load_5m: 0.0,
+    load_15m: 0.0,
+    load_per_core: 0.0,
+    load_status: "optimal",
     network_rx_kbs: 0,
     network_tx_kbs: 0,
     rps: 0,
@@ -63,7 +69,9 @@ function App() {
     memory_warning: 80.0,
     memory_critical: 95.0,
     disk_warning: 85.0,
-    disk_critical: 95.0
+    disk_critical: 95.0,
+    temp_warning: 75.0,
+    temp_critical: 85.0
   });
   const [thresholdMsg, setThresholdMsg] = useState("");
 
@@ -78,7 +86,7 @@ function App() {
       .then((res) => res.json())
       .then((data) => {
         setMetrics(data);
-        setHistory([{ cpu: data.cpu, memory: data.memory, rps: data.rps / 1000 }]);
+        setHistory([{ cpu: data.cpu, memory: data.memory, rps: data.rps / 1000, temp: data.temperature || 45 }]);
       })
       .catch((err) => console.log("Initial snapshot fetch error:", err));
 
@@ -109,7 +117,7 @@ function App() {
 
           setHistory((prev) => [
             ...prev.slice(-24),
-            { cpu: data.cpu, memory: data.memory, rps: data.rps / 1000 }
+            { cpu: data.cpu, memory: data.memory, rps: data.rps / 1000, temp: data.temperature || 45 }
           ]);
 
           fetchIncidents();
@@ -129,6 +137,17 @@ function App() {
         setTimeout(() => setToastMsg(""), 4000);
       })
       .catch((err) => setToastMsg("❌ Spike injection failed."));
+  };
+
+  // Handle / Shed Server Load
+  const handleHandleLoad = () => {
+    fetch("http://localhost:8000/api/simulate/handle-load", { method: "POST" })
+      .then((res) => res.json())
+      .then((data) => {
+        setToastMsg("🛡️ Server load shed & thermal performance stabilized!");
+        setTimeout(() => setToastMsg(""), 4000);
+      })
+      .catch((err) => setToastMsg("❌ Load handling failed."));
   };
 
   // Handle Threshold Form Submit
@@ -252,6 +271,11 @@ function App() {
             ⚡ Inject Traffic Load
           </button>
 
+          {/* Handle Load Action Button */}
+          <button className="handle-load-btn" onClick={handleHandleLoad}>
+            🛡️ Handle Load
+          </button>
+
           <div className={`status-badge ${metrics.status}`}>
             <span className="pulse-dot"></span>
             {metrics.status.toUpperCase()}
@@ -302,12 +326,12 @@ function App() {
         </div>
       </div>
 
-      {/* Main 4-Column Core Metric Cards */}
+      {/* Main 6-Column Core Metric Cards */}
       <div className="metrics-grid">
         {/* CPU Card */}
         <div className="metric-card">
           <div className="card-header">
-            <span className="card-title">⚡ CPU Load</span>
+            <span className="card-title">⚡ CPU Usage</span>
             <span className="card-subtext">{metrics.cpu_count} Cores</span>
           </div>
           <div className="card-value cyan">{metrics.cpu}%</div>
@@ -328,6 +352,48 @@ function App() {
               ))}
             </div>
           )}
+        </div>
+
+        {/* CPU Temperature Card */}
+        <div className="metric-card">
+          <div className="card-header">
+            <span className="card-title">🌡️ CPU Temperature</span>
+            <span className="card-subtext">Hardware Sensor</span>
+          </div>
+          <div className={`card-value ${metrics.temperature > (thresholds.temp_critical || 85) ? "rose" : (metrics.temperature > (thresholds.temp_warning || 75) ? "amber" : "cyan")}`}>
+            {metrics.temperature}°C
+          </div>
+          <div className="progress-track">
+            <div
+              className={`progress-fill ${metrics.temperature > (thresholds.temp_critical || 85) ? "rose" : (metrics.temperature > (thresholds.temp_warning || 75) ? "amber" : "cyan")}`}
+              style={{ width: `${Math.min((metrics.temperature / 100) * 100, 100)}%` }}
+            ></div>
+          </div>
+          <div className="card-subtext">
+            <span>Limit: {thresholds.temp_warning || 75}°C Warn</span>
+            <span>{metrics.temperature > (thresholds.temp_critical || 85) ? "🔥 Overheating" : (metrics.temperature > (thresholds.temp_warning || 75) ? "⚠️ High Temp" : "❄️ Normal")}</span>
+          </div>
+        </div>
+
+        {/* System Load Average Card */}
+        <div className="metric-card">
+          <div className="card-header">
+            <span className="card-title">⚖️ System Load</span>
+            <span className="card-subtext">1m / 5m / 15m Avg</span>
+          </div>
+          <div className={`card-value ${metrics.load_per_core > 1.2 ? "rose" : (metrics.load_per_core > 0.8 ? "amber" : "emerald")}`}>
+            {metrics.load_1m} <span style={{ fontSize: "0.85rem", fontWeight: "normal" }}>1m load</span>
+          </div>
+          <div className="progress-track">
+            <div
+              className={`progress-fill ${metrics.load_per_core > 1.2 ? "rose" : (metrics.load_per_core > 0.8 ? "amber" : "emerald")}`}
+              style={{ width: `${Math.min(((metrics.load_per_core || 0) / 2) * 100, 100)}%` }}
+            ></div>
+          </div>
+          <div className="card-subtext">
+            <span>5m: {metrics.load_5m} | 15m: {metrics.load_15m}</span>
+            <span>Ratio: {metrics.load_per_core} / Core</span>
+          </div>
         </div>
 
         {/* RAM Memory Card */}
@@ -437,6 +503,9 @@ function App() {
                 <div className="legend-color" style={{ background: "#06b6d4" }}></div> CPU Usage (%)
               </div>
               <div className="legend-item">
+                <div className="legend-color" style={{ background: "#f97316" }}></div> Temp (°C)
+              </div>
+              <div className="legend-item">
                 <div className="legend-color" style={{ background: "#6366f1" }}></div> RAM Usage (%)
               </div>
               <div className="legend-item">
@@ -475,6 +544,7 @@ function App() {
             {history.length > 1 && (
               <>
                 <path d={buildSvgPath("cpu")} fill="none" stroke="#06b6d4" strokeWidth="2.5" />
+                <path d={buildSvgPath("temp")} fill="none" stroke="#f97316" strokeWidth="2.5" />
                 <path d={buildSvgPath("memory")} fill="none" stroke="#6366f1" strokeWidth="2.5" />
                 <path d={buildSvgPath("rps")} fill="none" stroke="#10b981" strokeWidth="2" strokeDasharray="4 2" />
               </>
@@ -667,6 +737,24 @@ function App() {
                   type="number"
                   value={thresholds.memory_critical}
                   onChange={(e) => setThresholds({ ...thresholds, memory_critical: parseFloat(e.target.value) })}
+                />
+              </div>
+
+              <div className="field-group">
+                <label>Temp Warning Limit (°C)</label>
+                <input
+                  type="number"
+                  value={thresholds.temp_warning || 75}
+                  onChange={(e) => setThresholds({ ...thresholds, temp_warning: parseFloat(e.target.value) })}
+                />
+              </div>
+
+              <div className="field-group">
+                <label>Temp Critical Limit (°C)</label>
+                <input
+                  type="number"
+                  value={thresholds.temp_critical || 85}
+                  onChange={(e) => setThresholds({ ...thresholds, temp_critical: parseFloat(e.target.value) })}
                 />
               </div>
 

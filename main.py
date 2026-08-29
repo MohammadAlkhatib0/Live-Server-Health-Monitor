@@ -3,6 +3,7 @@ import time
 import psutil
 import platform
 import random
+import os
 from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -49,6 +50,8 @@ alert_config = {
     "memory_critical": 95.0,
     "disk_warning": 85.0,
     "disk_critical": 95.0,
+    "temp_warning": 75.0,
+    "temp_critical": 85.0,
 }
 
 consecutive_warnings = 0
@@ -60,6 +63,8 @@ class AlertConfigModel(BaseModel):
     memory_critical: float
     disk_warning: float
     disk_critical: float
+    temp_warning: float
+    temp_critical: float
 
 # Enterprise Node Catalog & Big Web Services
 NODES_CATALOG = [
@@ -146,6 +151,46 @@ def get_uptime_str() -> str:
     if days > 0:
         return f"{days}d {hours}h {minutes}m"
     return f"{hours}h {minutes}m {seconds}s"
+
+def get_cpu_temperature(node_id: str = "local", cpu_total: float = 0.0, is_spiking: bool = False) -> float:
+    """Read hardware CPU temperature or estimate realistically based on workload."""
+    if node_id == "local":
+        try:
+            temps = getattr(psutil, "sensors_temperatures", lambda: {})()
+            for key in ["coretemp", "cpu-thermal", "cpu_thermal", "k10temp", "zenpower", "nvme"]:
+                if key in temps and temps[key]:
+                    valid_temps = [item.current for item in temps[key] if item.current is not None and item.current > 0]
+                    if valid_temps:
+                        base_temp = max(valid_temps)
+                        return min(round(base_temp + (12.0 if is_spiking else 0.0), 1), 99.5)
+        except Exception:
+            pass
+
+    # Dynamic baseline temperature calculation fallback
+    base = 40.0 + (cpu_total * 0.42) + random.uniform(-1.5, 1.5)
+    if is_spiking:
+        base += random.uniform(15.0, 25.0)
+    return min(round(base, 1), 98.5)
+
+def get_system_load(node_id: str = "local", cpu_total: float = 0.0, cpu_count: int = 1, is_spiking: bool = False) -> Dict[str, float]:
+    """Capture real 1m/5m/15m load averages or calculate proportional load for cluster nodes."""
+    if node_id == "local" and hasattr(os, "getloadavg"):
+        try:
+            l1, l5, l15 = os.getloadavg()
+            multiplier = 1.6 if is_spiking else 1.0
+            return {
+                "load_1m": round(l1 * multiplier, 2),
+                "load_5m": round(l5 * multiplier, 2),
+                "load_15m": round(l15 * multiplier, 2)
+            }
+        except Exception:
+            pass
+
+    norm = (cpu_total / 100.0) * cpu_count
+    l1 = max(round(norm * (1.85 if is_spiking else 0.75) + random.uniform(-0.1, 0.2), 2), 0.1)
+    l5 = max(round(l1 * 0.88, 2), 0.1)
+    l15 = max(round(l1 * 0.76, 2), 0.1)
+    return {"load_1m": l1, "load_5m": l5, "load_15m": l15}
 
 def get_top_processes(limit: int = 10) -> List[Dict[str, Any]]:
     """Fetch top running processes sorted by CPU and Memory usage."""
@@ -295,21 +340,39 @@ def get_node_telemetry(node_id: str = "local") -> Dict[str, Any]:
             'total': 64 * 1024**3
         })()
 
-    # Determine Status
+    # Calculate Temperature & Load Averages
+    temperature = get_cpu_temperature(node_id, cpu_total, is_spiking)
+    load_metrics = get_system_load(node_id, cpu_total, cpu_count, is_spiking)
+    load_1m = load_metrics["load_1m"]
+    load_5m = load_metrics["load_5m"]
+    load_15m = load_metrics["load_15m"]
+    load_per_core = round(load_1m / max(cpu_count, 1), 2)
+
+    # Determine Status & Reasons
     status = "ok"
     reasons = []
-    if cpu_total >= alert_config["cpu_critical"] or mem.percent >= alert_config["memory_critical"]:
+    
+    if cpu_total >= alert_config["cpu_critical"] or mem.percent >= alert_config["memory_critical"] or temperature >= alert_config["temp_critical"]:
         status = "critical"
         if cpu_total >= alert_config["cpu_critical"]:
             reasons.append(f"CPU Critical Spike ({cpu_total}%)")
         if mem.percent >= alert_config["memory_critical"]:
             reasons.append(f"RAM Memory Exhaustion ({mem.percent}%)")
-    elif cpu_total >= alert_config["cpu_warning"] or mem.percent >= alert_config["memory_warning"]:
+        if temperature >= alert_config["temp_critical"]:
+            reasons.append(f"Thermal Critical Overheat ({temperature}°C)")
+    elif cpu_total >= alert_config["cpu_warning"] or mem.percent >= alert_config["memory_warning"] or temperature >= alert_config["temp_warning"]:
         status = "warning"
         if cpu_total >= alert_config["cpu_warning"]:
             reasons.append(f"High CPU Load ({cpu_total}%)")
         if mem.percent >= alert_config["memory_warning"]:
             reasons.append(f"High Memory Usage ({mem.percent}%)")
+        if temperature >= alert_config["temp_warning"]:
+            reasons.append(f"High Hardware Temperature ({temperature}°C)")
+
+    if load_per_core >= 1.5:
+        if status == "ok":
+            status = "warning"
+        reasons.append(f"High System Load Ratio ({load_1m} / {cpu_count} cores)")
 
     container_pods = generate_container_pods(node_id, is_spiking)
 
@@ -327,6 +390,12 @@ def get_node_telemetry(node_id: str = "local") -> Dict[str, Any]:
         "disk": disk.percent,
         "disk_used_gb": round(disk.used / (1024**3), 2),
         "disk_total_gb": round(disk.total / (1024**3), 2),
+        "temperature": temperature,
+        "load_1m": load_1m,
+        "load_5m": load_5m,
+        "load_15m": load_15m,
+        "load_per_core": load_per_core,
+        "load_status": "heavy" if load_per_core > 1.2 else ("moderate" if load_per_core > 0.7 else "optimal"),
         "network_rx_kbs": max(rx_rate, 0.0),
         "network_tx_kbs": max(tx_rate, 0.0),
         "rps": rps,
@@ -391,6 +460,10 @@ def save_reading_to_db(metrics: Dict[str, Any]):
             latency_ms=metrics.get("p95_latency_ms", 0.0),
             error_rate=metrics.get("error_rate_pct", 0.0),
             process_count=metrics.get("process_count", 0),
+            temperature=metrics.get("temperature", 45.0),
+            load_1m=metrics.get("load_1m", 0.0),
+            load_5m=metrics.get("load_5m", 0.0),
+            load_15m=metrics.get("load_15m", 0.0),
             status=metrics["status"]
         )
         with engine.connect() as conn:
@@ -430,6 +503,18 @@ def inject_traffic_spike():
     return {
         "message": "⚡ High Traffic Spike injected successfully for 15 seconds!",
         "spike_until": spike_until_time
+    }
+
+@app.post("/api/simulate/handle-load")
+def handle_server_load():
+    """Shed excess traffic load, clear active spikes, and stabilize node performance."""
+    global spike_until_time, consecutive_warnings
+    spike_until_time = 0.0
+    consecutive_warnings = 0
+    return {
+        "message": "🛡️ Load handled successfully! Excess traffic shed & system stabilized.",
+        "timestamp": int(time.time()),
+        "status": "stabilized"
     }
 
 # Incidents API Endpoints
@@ -516,9 +601,9 @@ def export_readings_csv():
         with engine.connect() as conn:
             result = conn.execute(stmt).mappings().all()
         
-        csv_lines = ["id,node_id,cpu_percent,memory_percent,disk_percent,network_rx_kbs,network_tx_kbs,rps,latency_ms,error_rate,process_count,status,created_at\n"]
+        csv_lines = ["id,node_id,cpu_percent,memory_percent,disk_percent,temperature_c,load_1m,load_5m,load_15m,network_rx_kbs,network_tx_kbs,rps,latency_ms,error_rate,process_count,status,created_at\n"]
         for row in result:
-            csv_lines.append(f"{row['id']},{row.get('node_id','local')},{row['value']},{row['memory_value']},{row.get('disk_value',0)},{row.get('network_rx',0)},{row.get('network_tx',0)},{row.get('rps',0)},{row.get('latency_ms',0)},{row.get('error_rate',0)},{row.get('process_count',0)},{row['status']},{row['created_at']}\n")
+            csv_lines.append(f"{row['id']},{row.get('node_id','local')},{row['value']},{row['memory_value']},{row.get('disk_value',0)},{row.get('temperature',45.0)},{row.get('load_1m',0)},{row.get('load_5m',0)},{row.get('load_15m',0)},{row.get('network_rx',0)},{row.get('network_tx',0)},{row.get('rps',0)},{row.get('latency_ms',0)},{row.get('error_rate',0)},{row.get('process_count',0)},{row['status']},{row['created_at']}\n")
         
         csv_content = "".join(csv_lines)
         return Response(content=csv_content, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=server_metrics_export.csv"})

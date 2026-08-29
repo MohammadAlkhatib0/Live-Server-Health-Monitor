@@ -26,6 +26,10 @@ readings = Table(
     Column("latency_ms", Float, nullable=True, default=0.0),     # p95 Latency ms
     Column("error_rate", Float, nullable=True, default=0.0),     # Error rate percentage
     Column("process_count", Integer, nullable=True, default=0),  # Active running process count
+    Column("temperature", Float, nullable=True, default=45.0),    # CPU/Hardware temperature in °C
+    Column("load_1m", Float, nullable=True, default=0.0),         # System Load Average 1-min
+    Column("load_5m", Float, nullable=True, default=0.0),         # System Load Average 5-min
+    Column("load_15m", Float, nullable=True, default=0.0),        # System Load Average 15-min
     Column("status", String, nullable=False),                    # "ok", "warning", or "critical"
     Column("created_at", DateTime, server_default=func.now())    # Timestamp
 )
