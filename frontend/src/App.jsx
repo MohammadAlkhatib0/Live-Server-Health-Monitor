@@ -1,7 +1,13 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import "./App.css";
 
 function App() {
+  // Authentication State (Tier 3 Stretch Goal)
+  const [isAuthenticated, setIsAuthenticated] = useState(true);
+  const [usernameInput, setUsernameInput] = useState("admin");
+  const [passwordInput, setPasswordInput] = useState("admin123");
+  const [authError, setAuthError] = useState("");
+
   // Multi-Node State
   const [selectedNode, setSelectedNode] = useState("local");
   const [nodesCatalog, setNodesCatalog] = useState([
@@ -51,20 +57,25 @@ function App() {
     container_pods: []
   });
 
-  // Historical Telemetry Data for SVG Charts
+  // Historical Telemetry Data for SVG Charts (Tier 2: last 20 readings)
   const [history, setHistory] = useState([]);
+
+  // Database Recent Readings (Step 8 & Step 10: last 10 readings on page load)
+  const [recentReadings, setRecentReadings] = useState([]);
+
+  // Live Warning Log (Step 11: running list of recent warnings live)
+  const [liveWarnings, setLiveWarnings] = useState([]);
 
   // Active Tab & Incident Management State
   const [activeTab, setActiveTab] = useState("analytics");
   const [incidents, setIncidents] = useState([]);
   const [searchTerm, setSearchTerm] = useState("");
   const [connStatus, setConnStatus] = useState("connecting");
-  const [latency, setLatency] = useState(0);
   const [toastMsg, setToastMsg] = useState("");
 
   // Alert Threshold Configuration State
   const [thresholds, setThresholds] = useState({
-    cpu_warning: 75.0,
+    cpu_warning: 80.0,
     cpu_critical: 90.0,
     memory_warning: 80.0,
     memory_critical: 95.0,
@@ -75,26 +86,15 @@ function App() {
   });
   const [thresholdMsg, setThresholdMsg] = useState("");
 
-  // 1. Fetch Node Catalog & Initial Telemetry
-  useEffect(() => {
-    fetch("http://localhost:8000/api/nodes")
-      .then((res) => res.json())
-      .then((catalog) => setNodesCatalog(catalog))
-      .catch((err) => console.log("Catalog fetch error:", err));
+  const wsRef = useRef(null);
 
-    fetch(`http://localhost:8000/api/nodes/${selectedNode}/metrics`)
+  // Fetch Recent Readings from DB (Step 8 & Step 10)
+  const fetchRecentReadings = () => {
+    fetch("http://localhost:8000/api/readings/recent?limit=10")
       .then((res) => res.json())
-      .then((data) => {
-        setMetrics(data);
-        setHistory([{ cpu: data.cpu, memory: data.memory, rps: data.rps / 1000, temp: data.temperature || 45 }]);
-      })
-      .catch((err) => console.log("Initial snapshot fetch error:", err));
-
-    fetch("http://localhost:8000/api/alerts/config")
-      .then((res) => res.json())
-      .then((data) => setThresholds(data))
-      .catch((err) => console.log("Thresholds fetch error:", err));
-  }, [selectedNode]);
+      .then((data) => setRecentReadings(data))
+      .catch((err) => console.log("Recent readings fetch error:", err));
+  };
 
   // Fetch Incidents from Database
   const fetchIncidents = () => {
@@ -104,50 +104,154 @@ function App() {
       .catch((err) => console.log("Fetch incidents error:", err));
   };
 
-  // 2. Polling / Telemetry Loop for Selected Node & Incidents
+  // 1. Initial Load: Catalog, Thresholds, & Recent History from DB
   useEffect(() => {
+    fetch("http://localhost:8000/api/nodes")
+      .then((res) => res.json())
+      .then((catalog) => setNodesCatalog(catalog))
+      .catch((err) => console.log("Catalog fetch error:", err));
+
+    fetch("http://localhost:8000/api/alerts/config")
+      .then((res) => res.json())
+      .then((data) => setThresholds(data))
+      .catch((err) => console.log("Thresholds fetch error:", err));
+
+    fetchRecentReadings();
     fetchIncidents();
-    const interval = setInterval(() => {
-      const pingStart = Date.now();
-      fetch(`http://localhost:8000/api/nodes/${selectedNode}/metrics`)
-        .then((res) => res.json())
-        .then((data) => {
-          setLatency(Date.now() - pingStart);
+  }, []);
+
+  // 2. Step 9: Establish WebSocket Connection to /ws/metrics on Page Load
+  useEffect(() => {
+    let isSubscribed = true;
+    let ws;
+
+    const connectWebSocket = () => {
+      setConnStatus("connecting");
+      const host = window.location.hostname || "localhost";
+      const wsUrl = `ws://${host}:8000/ws/metrics`;
+
+      ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        if (!isSubscribed) return;
+        setConnStatus("connected");
+        console.log("⚡ WebSocket connected to /ws/metrics");
+        ws.send(selectedNode);
+      };
+
+      ws.onmessage = (event) => {
+        if (!isSubscribed) return;
+        try {
+          const data = JSON.parse(event.data);
           setMetrics(data);
 
+          // Update SVG History (Tier 2: max 20 readings)
           setHistory((prev) => [
-            ...prev.slice(-24),
+            ...prev.slice(-19),
             { cpu: data.cpu, memory: data.memory, rps: data.rps / 1000, temp: data.temperature || 45 }
           ]);
 
-          fetchIncidents();
-        })
-        .catch((err) => console.log("Telemetry fetch error:", err));
-    }, 2000);
+          // Step 11: Live Warning List Prepend
+          if (data.status === "warning" || data.status === "critical") {
+            const newWarning = {
+              id: Date.now() + Math.random(),
+              node_name: data.node_info ? data.node_info.name : selectedNode,
+              value: data.cpu,
+              memory: data.memory,
+              status: data.status,
+              reasons: data.alert_reasons && data.alert_reasons.length > 0 ? data.alert_reasons.join(", ") : `High CPU ${data.cpu}%`,
+              created_at: new Date().toLocaleTimeString()
+            };
 
-    return () => clearInterval(interval);
+            setLiveWarnings((prev) => [newWarning, ...prev.slice(0, 19)]);
+          }
+
+          // Refresh DB readings & incidents periodically
+          fetchRecentReadings();
+          fetchIncidents();
+        } catch (e) {
+          console.error("WS message parse error:", e);
+        }
+      };
+
+      ws.onerror = (err) => {
+        console.warn("WebSocket error:", err);
+        setConnStatus("disconnected");
+      };
+
+      ws.onclose = () => {
+        if (!isSubscribed) return;
+        setConnStatus("disconnected");
+        console.log("WebSocket disconnected, reconnecting in 3s...");
+        setTimeout(() => {
+          if (isSubscribed) connectWebSocket();
+        }, 3000);
+      };
+    };
+
+    connectWebSocket();
+
+    return () => {
+      isSubscribed = false;
+      if (ws) ws.close();
+    };
+  }, []);
+
+  // Update active node via WebSocket when selectedNode changes
+  useEffect(() => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(selectedNode);
+    }
   }, [selectedNode]);
+
+  // Auth Handler (Tier 3)
+  const handleLoginSubmit = (e) => {
+    e.preventDefault();
+    setAuthError("");
+    fetch("http://localhost:8000/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: usernameInput, password: passwordInput })
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.success) {
+          setIsAuthenticated(true);
+          setToastMsg("🔓 Authenticated successfully as Admin!");
+          setTimeout(() => setToastMsg(""), 3000);
+        } else {
+          setAuthError(data.error || "Authentication failed.");
+        }
+      })
+      .catch(() => setAuthError("Server login error connection failed."));
+  };
 
   // Trigger Cyber Monday Traffic Spike
   const handleInjectSpike = () => {
     fetch("http://localhost:8000/api/simulate/spike", { method: "POST" })
       .then((res) => res.json())
-      .then((data) => {
+      .then(() => {
         setToastMsg("⚡ Traffic Load Spike Injected! High load active for 15s.");
         setTimeout(() => setToastMsg(""), 4000);
       })
-      .catch((err) => setToastMsg("❌ Spike injection failed."));
+      .catch(() => setToastMsg("❌ Spike injection failed."));
   };
 
   // Handle / Shed Server Load
   const handleHandleLoad = () => {
     fetch("http://localhost:8000/api/simulate/handle-load", { method: "POST" })
       .then((res) => res.json())
-      .then((data) => {
+      .then(() => {
         setToastMsg("🛡️ Server load shed & thermal performance stabilized!");
         setTimeout(() => setToastMsg(""), 4000);
       })
-      .catch((err) => setToastMsg("❌ Load handling failed."));
+      .catch(() => setToastMsg("❌ Load handling failed."));
+  };
+
+  // Resolve Live Warning (Tier 1 Goal)
+  const resolveLiveWarning = (id) => {
+    setLiveWarnings((prev) => prev.filter((item) => item.id !== id));
   };
 
   // Handle Threshold Form Submit
@@ -159,11 +263,11 @@ function App() {
       body: JSON.stringify(thresholds)
     })
       .then((res) => res.json())
-      .then((data) => {
+      .then(() => {
         setThresholdMsg("✅ Threshold rules updated!");
         setTimeout(() => setThresholdMsg(""), 3000);
       })
-      .catch((err) => setThresholdMsg("❌ Failed to update thresholds."));
+      .catch(() => setThresholdMsg("❌ Failed to update thresholds."));
   };
 
   // CSV Export
@@ -171,28 +275,7 @@ function App() {
     window.open("http://localhost:8000/api/export", "_blank");
   };
 
-  // Resolve Incident via Backend Database
-  const resolveIncident = (id) => {
-    fetch(`http://localhost:8000/api/incidents/${id}/resolve`, { method: "POST" })
-      .then((res) => res.json())
-      .then(() => {
-        setIncidents((prev) => prev.filter((item) => item.id !== id));
-      })
-      .catch((err) => console.log("Resolve incident error:", err));
-  };
-
-  // Resolve All Incidents via Backend Database
-  const handleResolveAllIncidents = () => {
-    fetch("http://localhost:8000/api/incidents/resolve-all", { method: "POST" })
-      .then((res) => res.json())
-      .then(() => {
-        setIncidents([]);
-      })
-      .catch((err) => console.log("Resolve all error:", err));
-  };
-
-
-  // SVG Chart Generators
+  // SVG Chart Generators (Tier 2 Goal: last 20 readings line chart)
   const buildSvgPath = (key) => {
     if (history.length < 2) return "";
     return history
@@ -242,13 +325,45 @@ function App() {
         </div>
       )}
 
+      {/* Tier 3 Auth Modal Guard */}
+      {!isAuthenticated && (
+        <div style={{
+          position: "fixed", inset: 0, zIndex: 10000,
+          background: "rgba(11, 15, 25, 0.92)", backdropFilter: "blur(20px)",
+          display: "flex", alignItems: "center", justifyContent: "center"
+        }}>
+          <div className="threshold-card" style={{ width: "360px", boxShadow: "0 12px 40px rgba(0,0,0,0.6)" }}>
+            <h2 style={{ fontSize: "1.3rem", fontWeight: "700", color: "#fff", marginBottom: "8px" }}>
+              🔒 Dashboard Authentication Required
+            </h2>
+            <p style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginBottom: "16px" }}>
+              Tier 3 Security: Log in with system administrator credentials.
+            </p>
+            <form onSubmit={handleLoginSubmit} className="threshold-form">
+              <div className="field-group">
+                <label>Username</label>
+                <input type="text" value={usernameInput} onChange={(e) => setUsernameInput(e.target.value)} required />
+              </div>
+              <div className="field-group">
+                <label>Password</label>
+                <input type="password" value={passwordInput} onChange={(e) => setPasswordInput(e.target.value)} required />
+              </div>
+              {authError && <div style={{ color: "#f43f5e", fontSize: "0.8rem", marginTop: "4px" }}>{authError}</div>}
+              <button type="submit" className="btn-primary" style={{ marginTop: "12px", justifyContent: "center" }}>
+                🔓 Access Dashboard
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
       {/* Top Navbar */}
       <div className="navbar">
         <div className="brand">
           <span className="brand-logo">⚡</span>
           <div className="brand-text">
-            <h1>Enterprise Cloud & Web Service Observability</h1>
-            <p>Big Tech Multi-Region Infrastructure & Cloud Simulator</p>
+            <h1>Live Server Health Monitor</h1>
+            <p>FastAPI + WebSocket + PostgreSQL Telemetry Dashboard</p>
           </div>
         </div>
 
@@ -266,27 +381,34 @@ function App() {
             ))}
           </select>
 
-          {/* Traffic Spike Button */}
-          <button className="spike-btn" onClick={handleInjectSpike}>
-            ⚡ Inject Traffic Load
-          </button>
+          {/* Step 9 WebSocket Connection Status Indicator */}
+          <div className="btn-secondary" title="WebSocket Status">
+            {connStatus === "connected" ? "🟢 WS Live" : "🔴 WS Reconnecting"}
+          </div>
 
-          {/* Handle Load Action Button */}
-          <button className="handle-load-btn" onClick={handleHandleLoad}>
-            🛡️ Handle Load
-          </button>
-
+          {/* Step 10 Color-Coded Status Badge */}
           <div className={`status-badge ${metrics.status}`}>
             <span className="pulse-dot"></span>
             {metrics.status.toUpperCase()}
           </div>
 
-          <div className="btn-secondary" title="Network Ping Latency">
-            📶 {latency}ms
-          </div>
+          {/* Traffic Spike Button */}
+          <button className="spike-btn" onClick={handleInjectSpike}>
+            ⚡ Inject Load
+          </button>
+
+          {/* Handle Load Action Button */}
+          <button className="handle-load-btn" onClick={handleHandleLoad}>
+            🛡️ Shed Load
+          </button>
 
           <button className="btn-secondary" onClick={handleExportCSV}>
-            📥 Export Log
+            📥 Export CSV
+          </button>
+
+          {/* Auth Lock Toggle (Tier 3) */}
+          <button className="btn-secondary" onClick={() => setIsAuthenticated(!isAuthenticated)}>
+            {isAuthenticated ? "🔒 Lock" : "🔓 Unlock"}
           </button>
         </div>
       </div>
@@ -312,7 +434,7 @@ function App() {
         <div className="info-pill">
           <span className="info-icon">💻</span>
           <div className="info-details">
-            <div className="label">Platform / Arch</div>
+            <div className="label">Platform / Cores</div>
             <div className="value">{metrics.platform} ({metrics.cpu_count} Cores)</div>
           </div>
         </div>
@@ -320,38 +442,54 @@ function App() {
         <div className="info-pill">
           <span className="info-icon">🚨</span>
           <div className="info-details">
-            <div className="label">Active Incidents</div>
-            <div className="value">{incidents.length} Unresolved</div>
+            <div className="label">Active Warnings</div>
+            <div className="value">{liveWarnings.length} Live Logged</div>
           </div>
         </div>
       </div>
 
-      {/* Main 6-Column Core Metric Cards */}
+      {/* Main Metric Cards Grid (Step 9 & Tier 1) */}
       <div className="metrics-grid">
-        {/* CPU Card */}
+        {/* CPU Usage Card (Step 9: Updating Live) */}
         <div className="metric-card">
           <div className="card-header">
-            <span className="card-title">⚡ CPU Usage</span>
+            <span className="card-title">⚡ Real CPU Usage</span>
             <span className="card-subtext">{metrics.cpu_count} Cores</span>
           </div>
-          <div className="card-value cyan">{metrics.cpu}%</div>
+          <div className={`card-value ${metrics.cpu > (thresholds.cpu_warning || 80) ? "rose" : "cyan"}`}>
+            {metrics.cpu}%
+          </div>
           <div className="progress-track">
-            <div className="progress-fill cyan" style={{ width: `${Math.min(metrics.cpu, 100)}%` }}></div>
+            <div
+              className={`progress-fill ${metrics.cpu > (thresholds.cpu_warning || 80) ? "rose" : "cyan"}`}
+              style={{ width: `${Math.min(metrics.cpu, 100)}%` }}
+            ></div>
           </div>
           <div className="card-subtext">
-            <span>Core Usage:</span>
-            <span>{metrics.cpu_cores ? metrics.cpu_cores.length : 0} Cores Active</span>
+            <span>Threshold: {thresholds.cpu_warning || 80}% Warn</span>
+            <span>{metrics.cpu > (thresholds.cpu_warning || 80) ? "⚠️ High CPU" : "✅ Normal"}</span>
           </div>
-          {metrics.cpu_cores && metrics.cpu_cores.length > 0 && (
-            <div className="core-grid">
-              {metrics.cpu_cores.slice(0, 8).map((c, i) => (
-                <div key={i} className="core-bar" title={`Core ${i + 1}: ${c}%`}>
-                  <div className="core-fill" style={{ width: `${c}%` }}></div>
-                  <span className="core-num">C{i + 1}</span>
-                </div>
-              ))}
-            </div>
-          )}
+        </div>
+
+        {/* RAM Memory Card (Tier 1 Goal: Second Real Metric) */}
+        <div className="metric-card">
+          <div className="card-header">
+            <span className="card-title">💾 RAM Memory Usage</span>
+            <span className="card-subtext">{metrics.memory_used_gb} / {metrics.memory_total_gb} GB</span>
+          </div>
+          <div className={`card-value ${metrics.memory > (thresholds.memory_warning || 80) ? "amber" : "indigo"}`}>
+            {metrics.memory}%
+          </div>
+          <div className="progress-track">
+            <div
+              className={`progress-fill ${metrics.memory > (thresholds.memory_warning || 80) ? "amber" : "indigo"}`}
+              style={{ width: `${Math.min(metrics.memory, 100)}%` }}
+            ></div>
+          </div>
+          <div className="card-subtext">
+            <span>Threshold: {thresholds.memory_warning || 80}% Warn</span>
+            <span>Swap: {metrics.swap_percent}%</span>
+          </div>
         </div>
 
         {/* CPU Temperature Card */}
@@ -360,18 +498,18 @@ function App() {
             <span className="card-title">🌡️ CPU Temperature</span>
             <span className="card-subtext">Hardware Sensor</span>
           </div>
-          <div className={`card-value ${metrics.temperature > (thresholds.temp_critical || 85) ? "rose" : (metrics.temperature > (thresholds.temp_warning || 75) ? "amber" : "cyan")}`}>
+          <div className={`card-value ${metrics.temperature > 85 ? "rose" : (metrics.temperature > 75 ? "amber" : "cyan")}`}>
             {metrics.temperature}°C
           </div>
           <div className="progress-track">
             <div
-              className={`progress-fill ${metrics.temperature > (thresholds.temp_critical || 85) ? "rose" : (metrics.temperature > (thresholds.temp_warning || 75) ? "amber" : "cyan")}`}
+              className={`progress-fill ${metrics.temperature > 85 ? "rose" : (metrics.temperature > 75 ? "amber" : "cyan")}`}
               style={{ width: `${Math.min((metrics.temperature / 100) * 100, 100)}%` }}
             ></div>
           </div>
           <div className="card-subtext">
-            <span>Limit: {thresholds.temp_warning || 75}°C Warn</span>
-            <span>{metrics.temperature > (thresholds.temp_critical || 85) ? "🔥 Overheating" : (metrics.temperature > (thresholds.temp_warning || 75) ? "⚠️ High Temp" : "❄️ Normal")}</span>
+            <span>System Temp</span>
+            <span>{metrics.temperature > 75 ? "🔥 Elevated" : "❄️ Optimal"}</span>
           </div>
         </div>
 
@@ -379,40 +517,24 @@ function App() {
         <div className="metric-card">
           <div className="card-header">
             <span className="card-title">⚖️ System Load</span>
-            <span className="card-subtext">1m / 5m / 15m Avg</span>
+            <span className="card-subtext">1m / 5m / 15m</span>
           </div>
-          <div className={`card-value ${metrics.load_per_core > 1.2 ? "rose" : (metrics.load_per_core > 0.8 ? "amber" : "emerald")}`}>
-            {metrics.load_1m} <span style={{ fontSize: "0.85rem", fontWeight: "normal" }}>1m load</span>
+          <div className={`card-value ${metrics.load_per_core > 1.2 ? "rose" : "emerald"}`}>
+            {metrics.load_1m} <span style={{ fontSize: "0.85rem" }}>1m</span>
           </div>
           <div className="progress-track">
             <div
-              className={`progress-fill ${metrics.load_per_core > 1.2 ? "rose" : (metrics.load_per_core > 0.8 ? "amber" : "emerald")}`}
+              className={`progress-fill ${metrics.load_per_core > 1.2 ? "rose" : "emerald"}`}
               style={{ width: `${Math.min(((metrics.load_per_core || 0) / 2) * 100, 100)}%` }}
             ></div>
           </div>
           <div className="card-subtext">
             <span>5m: {metrics.load_5m} | 15m: {metrics.load_15m}</span>
-            <span>Ratio: {metrics.load_per_core} / Core</span>
+            <span>{metrics.load_per_core}/core</span>
           </div>
         </div>
 
-        {/* RAM Memory Card */}
-        <div className="metric-card">
-          <div className="card-header">
-            <span className="card-title">💾 RAM Memory</span>
-            <span className="card-subtext">{metrics.memory_used_gb} / {metrics.memory_total_gb} GB</span>
-          </div>
-          <div className="card-value indigo">{metrics.memory}%</div>
-          <div className="progress-track">
-            <div className="progress-fill indigo" style={{ width: `${Math.min(metrics.memory, 100)}%` }}></div>
-          </div>
-          <div className="card-subtext">
-            <span>Swap Allocation:</span>
-            <span>{metrics.swap_percent}% Used</span>
-          </div>
-        </div>
-
-        {/* RPS & Throughput Card */}
+        {/* RPS & Latency Card */}
         <div className="metric-card">
           <div className="card-header">
             <span className="card-title">🚀 Throughput (RPS)</span>
@@ -426,12 +548,12 @@ function App() {
             ></div>
           </div>
           <div className="card-subtext">
-            <span>p95 Latency: {metrics.p95_latency_ms}ms</span>
-            <span>Error Rate: {metrics.error_rate_pct}%</span>
+            <span>p95: {metrics.p95_latency_ms}ms</span>
+            <span>Errors: {metrics.error_rate_pct}%</span>
           </div>
         </div>
 
-        {/* Network Throughput Card */}
+        {/* Network Transfer Card */}
         <div className="metric-card">
           <div className="card-header">
             <span className="card-title">🌐 Bandwidth I/O</span>
@@ -453,63 +575,60 @@ function App() {
         </div>
       </div>
 
-      {/* Tabs Navigation */}
+      {/* Navigation Tabs */}
       <div className="tabs-header">
         <button
           className={`tab-btn ${activeTab === "analytics" ? "active" : ""}`}
           onClick={() => setActiveTab("analytics")}
         >
-          📈 Live Analytics & Telemetry
+          📈 Live Analytics & SVG Line Chart (Tier 2)
         </button>
 
         <button
-          className={`tab-btn ${activeTab === "global-services" ? "active" : ""}`}
-          onClick={() => setActiveTab("global-services")}
+          className={`tab-btn ${activeTab === "recent-history" ? "active" : ""}`}
+          onClick={() => setActiveTab("recent-history")}
         >
-          🌐 Global Cloud & Web Services Status ({nodesCatalog.length})
+          🗄️ Recent History (Step 8 & 10)
         </button>
 
         <button
-          className={`tab-btn ${activeTab === "pods" ? "active" : ""}`}
-          onClick={() => setActiveTab("pods")}
+          className={`tab-btn ${activeTab === "warnings-feed" ? "active" : ""}`}
+          onClick={() => setActiveTab("warnings-feed")}
         >
-          🧊 Container Pod Matrix ({metrics.container_pods ? metrics.container_pods.length : 0})
+          🚨 Live Warnings Log ({liveWarnings.length}) (Step 11)
         </button>
 
         <button
           className={`tab-btn ${activeTab === "processes" ? "active" : ""}`}
           onClick={() => setActiveTab("processes")}
         >
-          ⚙️ Process Manager ({metrics.top_processes ? metrics.top_processes.length : 0})
+          ⚙️ Process Manager
         </button>
 
         <button
-          className={`tab-btn ${activeTab === "incidents" ? "active" : ""}`}
-          onClick={() => setActiveTab("incidents")}
+          className={`tab-btn ${activeTab === "thresholds" ? "active" : ""}`}
+          onClick={() => setActiveTab("thresholds")}
         >
-          🚨 Alert Center ({incidents.length})
+          ⚙️ Threshold Rules
         </button>
       </div>
 
-      {/* Tab 1: Real-Time Telemetry Analytics */}
+      {/* Tab 1: Live Analytics & SVG Line Chart (Tier 2 Goal: Last 20 Readings Chart) */}
       {activeTab === "analytics" && (
         <div className="chart-container">
           <div className="chart-header">
             <div className="chart-title">
-              <h3>Live Telemetry Trend (Node: {metrics.node_info ? metrics.node_info.name : selectedNode})</h3>
+              <h3>Live Line Chart (Last 20 Readings) — Node: {metrics.node_info ? metrics.node_info.name : selectedNode}</h3>
             </div>
             <div className="chart-legend">
               <div className="legend-item">
                 <div className="legend-color" style={{ background: "#06b6d4" }}></div> CPU Usage (%)
               </div>
               <div className="legend-item">
+                <div className="legend-color" style={{ background: "#6366f1" }}></div> Memory Usage (%)
+              </div>
+              <div className="legend-item">
                 <div className="legend-color" style={{ background: "#f97316" }}></div> Temp (°C)
-              </div>
-              <div className="legend-item">
-                <div className="legend-color" style={{ background: "#6366f1" }}></div> RAM Usage (%)
-              </div>
-              <div className="legend-item">
-                <div className="legend-color" style={{ background: "#10b981" }}></div> RPS / 100
               </div>
             </div>
           </div>
@@ -526,13 +645,13 @@ function App() {
               </linearGradient>
             </defs>
 
-            {/* Horizontal Gridlines */}
+            {/* Gridlines */}
             <line x1="0" y1="20" x2="500" y2="20" stroke="#1e293b" strokeDasharray="3 3" />
             <line x1="0" y1="50" x2="500" y2="50" stroke="#1e293b" strokeDasharray="3 3" />
             <line x1="0" y1="80" x2="500" y2="80" stroke="#1e293b" strokeDasharray="3 3" />
             <line x1="0" y1="110" x2="500" y2="110" stroke="#1e293b" strokeDasharray="3 3" />
 
-            {/* Area Fills */}
+            {/* Line Areas */}
             {history.length > 1 && (
               <>
                 <path d={buildAreaPath("cpu")} fill="url(#cpuGrad)" />
@@ -540,81 +659,121 @@ function App() {
               </>
             )}
 
-            {/* Lines */}
+            {/* SVG Trend Lines */}
             {history.length > 1 && (
               <>
                 <path d={buildSvgPath("cpu")} fill="none" stroke="#06b6d4" strokeWidth="2.5" />
-                <path d={buildSvgPath("temp")} fill="none" stroke="#f97316" strokeWidth="2.5" />
                 <path d={buildSvgPath("memory")} fill="none" stroke="#6366f1" strokeWidth="2.5" />
-                <path d={buildSvgPath("rps")} fill="none" stroke="#10b981" strokeWidth="2" strokeDasharray="4 2" />
+                <path d={buildSvgPath("temp")} fill="none" stroke="#f97316" strokeWidth="2.5" />
               </>
             )}
           </svg>
         </div>
       )}
 
-      {/* Tab 2: Global Cloud & Services Status */}
-      {activeTab === "global-services" && (
-        <div className="global-services-grid">
-          {nodesCatalog.map((node) => (
-            <div key={node.id} className="service-card">
-              <div className="service-card-header">
-                <span className="service-name">{node.name}</span>
-                <span className="proc-badge" style={{ background: "rgba(16, 185, 129, 0.2)", color: "#34d399" }}>
-                  {node.status.toUpperCase()}
-                </span>
-              </div>
-              <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginBottom: "8px" }}>
-                Provider: <strong>{node.provider}</strong> | Region: {node.region}
-              </div>
-              <button
-                className="btn-secondary"
-                style={{ width: "100%", justifyContent: "center" }}
-                onClick={() => {
-                  setSelectedNode(node.id);
-                  setActiveTab("analytics");
-                }}
-              >
-                🔍 Inspect Node Telemetry
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Tab 3: Container Pod Matrix */}
-      {activeTab === "pods" && (
-        <div className="pod-matrix-container">
+      {/* Tab 2: Step 8 & Step 10 — Recent History from Database (Last 10 Readings) */}
+      {activeTab === "recent-history" && (
+        <div className="process-table-container">
           <div className="table-header">
-            <h3>Microservice Kubernetes Container Pod Matrix ({metrics.container_pods ? metrics.container_pods.length : 0} Pods)</h3>
-            <button className="spike-btn" onClick={handleInjectSpike}>
-              ⚡ Trigger Pod Failover Test
+            <h3>🗄️ Last 10 Database Readings (GET /api/readings/recent)</h3>
+            <button className="btn-secondary" onClick={fetchRecentReadings}>
+              🔄 Refresh List
             </button>
           </div>
 
-          <div className="pod-matrix-grid">
-            {(metrics.container_pods || []).map((pod) => (
-              <div key={pod.id} className={`pod-box ${pod.status}`}>
-                <div className="pod-name" title={pod.name}>
-                  {pod.name}
-                </div>
-                <div className="pod-stats">CPU: {pod.cpu}%</div>
-                <div className="pod-stats">RAM: {pod.memory}%</div>
-                <div className="pod-stats">Restarts: {pod.restarts}</div>
-              </div>
-            ))}
-          </div>
+          <table className="process-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Target Node</th>
+                <th>CPU Usage (%)</th>
+                <th>RAM Usage (%)</th>
+                <th>Temperature (°C)</th>
+                <th>Status</th>
+                <th>Timestamp</th>
+              </tr>
+            </thead>
+            <tbody>
+              {recentReadings.length === 0 ? (
+                <tr>
+                  <td colSpan="7" style={{ textAlign: "center", color: "#94a3b8", padding: "20px" }}>
+                    No readings recorded in database yet.
+                  </td>
+                </tr>
+              ) : (
+                recentReadings.map((row) => (
+                  <tr key={row.id}>
+                    <td><code>#{row.id}</code></td>
+                    <td>{row.node_id || "local"}</td>
+                    <td style={{ fontWeight: "700", color: row.value > (thresholds.cpu_warning || 80) ? "#f43f5e" : "#06b6d4" }}>
+                      {row.value}%
+                    </td>
+                    <td style={{ fontWeight: "700", color: "#6366f1" }}>
+                      {row.memory_value || 0}%
+                    </td>
+                    <td>{row.temperature || 45}°C</td>
+                    <td>
+                      <span className={`proc-badge`} style={{
+                        background: row.status === "critical" ? "rgba(244,63,94,0.2)" : (row.status === "warning" ? "rgba(245,158,11,0.2)" : "rgba(16,185,129,0.15)"),
+                        color: row.status === "critical" ? "#f87171" : (row.status === "warning" ? "#fbbf24" : "#34d399")
+                      }}>
+                        {row.status.toUpperCase()}
+                      </span>
+                    </td>
+                    <td>{new Date(row.created_at || Date.now()).toLocaleTimeString()}</td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
         </div>
       )}
 
-      {/* Tab 4: Top Running Process Manager */}
+      {/* Tab 3: Step 11 & Tier 1 — Live Warnings Feed (Prepend Live & Resolve Button) */}
+      {activeTab === "warnings-feed" && (
+        <div className="incident-card">
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem" }}>
+            <h3>🚨 Live Warnings Feed (Prepend Live on High CPU/Mem Spike)</h3>
+            {liveWarnings.length > 0 && (
+              <button className="btn-secondary" onClick={() => setLiveWarnings([])}>
+                Clear Warnings List
+              </button>
+            )}
+          </div>
+
+          {liveWarnings.length === 0 ? (
+            <p style={{ color: "#94a3b8", marginTop: "1rem", fontStyle: "italic" }}>
+              ✅ No high CPU/memory warnings currently logged. Everything operating normally!
+            </p>
+          ) : (
+            <div className="incident-list">
+              {liveWarnings.map((item) => (
+                <div key={item.id} className={`incident-item ${item.status}`}>
+                  <div>
+                    <strong style={{ textTransform: "uppercase" }}>[{item.status}]</strong> {item.reasons}
+                    <div style={{ fontSize: "0.75rem", color: "#94a3b8", marginTop: "2px" }}>
+                      Node: {item.node_name} | CPU: {item.value}% | RAM: {item.memory}% | Logged: {item.created_at}
+                    </div>
+                  </div>
+                  {/* Tier 1 Goal: Resolve Button */}
+                  <button className="btn-secondary" onClick={() => resolveLiveWarning(item.id)}>
+                    ✓ Resolve Warning
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Tab 4: Process Manager */}
       {activeTab === "processes" && (
         <div className="process-table-container">
           <div className="table-header">
             <h3>Active System Processes ({selectedNode})</h3>
             <input
               type="text"
-              placeholder="🔍 Search process name, PID, or user..."
+              placeholder="🔍 Search process name or PID..."
               className="search-input"
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
@@ -636,7 +795,7 @@ function App() {
               {filteredProcesses.length === 0 ? (
                 <tr>
                   <td colSpan="6" style={{ textAlign: "center", color: "#94a3b8", padding: "20px" }}>
-                    No running processes match search query.
+                    No matching processes found.
                   </td>
                 </tr>
               ) : (
@@ -660,115 +819,57 @@ function App() {
         </div>
       )}
 
-      {/* Tab 5: Alert Center & Threshold Settings */}
-      {activeTab === "incidents" && (
-        <div className="incident-container">
-          <div className="incident-card">
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem" }}>
-              <h3 style={{ margin: 0 }}>🚨 Incident Log ({incidents.length})</h3>
-              {incidents.length > 0 && (
-                <button
-                  className="btn-secondary"
-                  style={{ background: "rgba(16, 185, 129, 0.2)", color: "#34d399", borderColor: "rgba(16, 185, 129, 0.4)" }}
-                  onClick={handleResolveAllIncidents}
-                >
-                  ✓ Resolve All Incidents
-                </button>
-              )}
+      {/* Tab 5: Threshold Config Rules */}
+      {activeTab === "thresholds" && (
+        <div className="threshold-card" style={{ maxWidth: "500px" }}>
+          <h3>⚙️ Configure Alert Thresholds</h3>
+          <form onSubmit={handleSaveThresholds} className="threshold-form">
+            <div className="field-group">
+              <label>CPU Warning Threshold (%) [Step 7 Default: 80%]</label>
+              <input
+                type="number"
+                value={thresholds.cpu_warning}
+                onChange={(e) => setThresholds({ ...thresholds, cpu_warning: parseFloat(e.target.value) })}
+              />
             </div>
 
-            {incidents.length === 0 ? (
-              <p style={{ color: "#94a3b8", marginTop: "1rem", fontStyle: "italic" }}>
-                ✅ All system telemetry parameters operating normally.
-              </p>
-            ) : (
-              <div className="incident-list">
-                {incidents.map((item) => (
-                  <div key={item.id} className={`incident-item ${item.status}`}>
-                    <div>
-                      <strong style={{ textTransform: "uppercase" }}>[{item.status}]</strong> {item.reason || item.reasons}
-                      <div style={{ fontSize: "0.75rem", color: "#94a3b8", marginTop: "2px" }}>
-                        Node: {item.node_name || item.node || "Local Host"} | Created: {new Date(item.created_at || Date.now()).toLocaleTimeString()} | CPU: {item.cpu_percent || item.cpu}%
-                      </div>
-                    </div>
-                    <button className="btn-secondary" onClick={() => resolveIncident(item.id)}>
-                      ✓ Resolve
-                    </button>
-                  </div>
-                ))}
+            <div className="field-group">
+              <label>CPU Critical Threshold (%)</label>
+              <input
+                type="number"
+                value={thresholds.cpu_critical}
+                onChange={(e) => setThresholds({ ...thresholds, cpu_critical: parseFloat(e.target.value) })}
+              />
+            </div>
+
+            <div className="field-group">
+              <label>RAM Memory Warning Threshold (%) [Tier 1 Goal]</label>
+              <input
+                type="number"
+                value={thresholds.memory_warning}
+                onChange={(e) => setThresholds({ ...thresholds, memory_warning: parseFloat(e.target.value) })}
+              />
+            </div>
+
+            <div className="field-group">
+              <label>RAM Memory Critical Threshold (%)</label>
+              <input
+                type="number"
+                value={thresholds.memory_critical}
+                onChange={(e) => setThresholds({ ...thresholds, memory_critical: parseFloat(e.target.value) })}
+              />
+            </div>
+
+            <button type="submit" className="btn-primary" style={{ marginTop: "10px" }}>
+              💾 Save Alert Rules
+            </button>
+
+            {thresholdMsg && (
+              <div style={{ fontSize: "0.8rem", color: "#34d399", textAlign: "center", marginTop: "6px" }}>
+                {thresholdMsg}
               </div>
             )}
-          </div>
-
-
-          <div className="threshold-card">
-            <h3>⚙️ Threshold Rules</h3>
-            <form onSubmit={handleSaveThresholds} className="threshold-form">
-              <div className="field-group">
-                <label>CPU Warning Limit (%)</label>
-                <input
-                  type="number"
-                  value={thresholds.cpu_warning}
-                  onChange={(e) => setThresholds({ ...thresholds, cpu_warning: parseFloat(e.target.value) })}
-                />
-              </div>
-
-              <div className="field-group">
-                <label>CPU Critical Limit (%)</label>
-                <input
-                  type="number"
-                  value={thresholds.cpu_critical}
-                  onChange={(e) => setThresholds({ ...thresholds, cpu_critical: parseFloat(e.target.value) })}
-                />
-              </div>
-
-              <div className="field-group">
-                <label>Memory Warning Limit (%)</label>
-                <input
-                  type="number"
-                  value={thresholds.memory_warning}
-                  onChange={(e) => setThresholds({ ...thresholds, memory_warning: parseFloat(e.target.value) })}
-                />
-              </div>
-
-              <div className="field-group">
-                <label>Memory Critical Limit (%)</label>
-                <input
-                  type="number"
-                  value={thresholds.memory_critical}
-                  onChange={(e) => setThresholds({ ...thresholds, memory_critical: parseFloat(e.target.value) })}
-                />
-              </div>
-
-              <div className="field-group">
-                <label>Temp Warning Limit (°C)</label>
-                <input
-                  type="number"
-                  value={thresholds.temp_warning || 75}
-                  onChange={(e) => setThresholds({ ...thresholds, temp_warning: parseFloat(e.target.value) })}
-                />
-              </div>
-
-              <div className="field-group">
-                <label>Temp Critical Limit (°C)</label>
-                <input
-                  type="number"
-                  value={thresholds.temp_critical || 85}
-                  onChange={(e) => setThresholds({ ...thresholds, temp_critical: parseFloat(e.target.value) })}
-                />
-              </div>
-
-              <button type="submit" className="btn-primary" style={{ marginTop: "10px" }}>
-                💾 Save Threshold Rules
-              </button>
-
-              {thresholdMsg && (
-                <div style={{ fontSize: "0.8rem", color: "#34d399", textAlign: "center", marginTop: "6px" }}>
-                  {thresholdMsg}
-                </div>
-              )}
-            </form>
-          </div>
+          </form>
         </div>
       )}
     </div>
@@ -776,5 +877,3 @@ function App() {
 }
 
 export default App;
-
-

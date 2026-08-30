@@ -44,7 +44,7 @@ spike_until_time = 0.0
 
 # Configurable Alert Thresholds
 alert_config = {
-    "cpu_warning": 75.0,
+    "cpu_warning": 80.0,
     "cpu_critical": 90.0,
     "memory_warning": 80.0,
     "memory_critical": 95.0,
@@ -65,6 +65,11 @@ class AlertConfigModel(BaseModel):
     disk_critical: float
     temp_warning: float
     temp_critical: float
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
 
 # Enterprise Node Catalog & Big Web Services
 NODES_CATALOG = [
@@ -354,6 +359,7 @@ def get_node_telemetry(node_id: str = "local") -> Dict[str, Any]:
     
     if cpu_total >= alert_config["cpu_critical"] or mem.percent >= alert_config["memory_critical"] or temperature >= alert_config["temp_critical"]:
         status = "critical"
+        consecutive_warnings = 0
         if cpu_total >= alert_config["cpu_critical"]:
             reasons.append(f"CPU Critical Spike ({cpu_total}%)")
         if mem.percent >= alert_config["memory_critical"]:
@@ -362,17 +368,28 @@ def get_node_telemetry(node_id: str = "local") -> Dict[str, Any]:
             reasons.append(f"Thermal Critical Overheat ({temperature}°C)")
     elif cpu_total >= alert_config["cpu_warning"] or mem.percent >= alert_config["memory_warning"] or temperature >= alert_config["temp_warning"]:
         status = "warning"
+        consecutive_warnings += 1
+        if consecutive_warnings >= 3:
+            status = "critical"
+            reasons.append(f"🚨 3 Consecutive Warnings in a Row ({consecutive_warnings}x)")
         if cpu_total >= alert_config["cpu_warning"]:
             reasons.append(f"High CPU Load ({cpu_total}%)")
         if mem.percent >= alert_config["memory_warning"]:
             reasons.append(f"High Memory Usage ({mem.percent}%)")
         if temperature >= alert_config["temp_warning"]:
             reasons.append(f"High Hardware Temperature ({temperature}°C)")
+    else:
+        consecutive_warnings = 0
 
     if load_per_core >= 1.5:
         if status == "ok":
             status = "warning"
+            consecutive_warnings += 1
+            if consecutive_warnings >= 3:
+                status = "critical"
+                reasons.append(f"🚨 3 Consecutive Warnings in a Row ({consecutive_warnings}x)")
         reasons.append(f"High System Load Ratio ({load_1m} / {cpu_count} cores)")
+
 
     container_pods = generate_container_pods(node_id, is_spiking)
 
@@ -566,7 +583,7 @@ def resolve_all_incidents():
         return {"error": str(e)}
 
 @app.get("/api/readings/recent")
-def get_recent_readings(limit: int = Query(20, ge=1, le=100)):
+def get_recent_readings(limit: int = Query(10, ge=1, le=100)):
     """Fetch recent historical telemetry readings from PostgreSQL database."""
     try:
         stmt = select(readings).order_by(desc(readings.c.id)).limit(limit)
@@ -609,6 +626,15 @@ def export_readings_csv():
         return Response(content=csv_content, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=server_metrics_export.csv"})
     except Exception as e:
         return Response(content=f"Error exporting CSV: {e}", status_code=500)
+
+# Authentication Endpoints (Tier 3 Stretch Goal)
+
+@app.post("/api/auth/login")
+def login_auth(creds: LoginRequest):
+    """Authenticate admin user for dashboard access."""
+    if creds.username == "admin" and creds.password == "admin123":
+        return {"success": True, "token": "server-health-admin-token-9988", "user": creds.username}
+    return Response(content='{"success": false, "error": "Invalid credentials. Use admin / admin123"}', status_code=401, media_type="application/json")
 
 # Real-Time WebSocket Endpoint
 
